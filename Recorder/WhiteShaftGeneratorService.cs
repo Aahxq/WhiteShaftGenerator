@@ -23,6 +23,7 @@ public sealed class WhiteShaftGeneratorService : IDisposable
     private const int DefaultDeduplicationMs = 300;
     private const int AbilityEffectDeduplicationMs = 400;
     private const int ExportSkillMergeMs = 2500;
+    private const int ExportRepeatedAbilityMergeMs = 6000;
     private const int ExportTargetableMergeMs = 1000;
     private const int ExportTargetIconMergeMs = 1000;
     private const int ExportStatusNearSkillSuppressMs = 5000;
@@ -595,8 +596,9 @@ public sealed class WhiteShaftGeneratorService : IDisposable
 
         try
         {
-            var exportEntries = SimplifyEntriesForExport(entries);
-            var document = BuildPureTimelineDocument(exportEntries, reason);
+            var exportResult = SimplifyEntriesForExport(entries);
+            var exportEntries = exportResult.Entries;
+            var document = BuildPureTimelineDocument(exportEntries, reason, exportResult.Stats);
             var outputDirectory = ResolveOutputDirectory();
             Directory.CreateDirectory(outputDirectory);
 
@@ -608,7 +610,7 @@ public sealed class WhiteShaftGeneratorService : IDisposable
                 WriteIndented = true,
                 Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
             });
-            var cactbotTimeline = BuildCactbotTimeline(exportEntries);
+            var cactbotTimeline = BuildCactbotTimeline(exportResult);
 
             File.WriteAllText(jsonPath, json);
             File.WriteAllText(cactbotPath, cactbotTimeline, Encoding.UTF8);
@@ -622,16 +624,24 @@ public sealed class WhiteShaftGeneratorService : IDisposable
         }
     }
 
-    private static List<RecordedEntry> SimplifyEntriesForExport(IReadOnlyList<RecordedEntry> entries)
+    private static ExportResult SimplifyEntriesForExport(IReadOnlyList<RecordedEntry> entries)
     {
         var result = new List<RecordedEntry>();
         var recentKeys = new Dictionary<string, DateTime>(StringComparer.Ordinal);
+        var recentMergeEntries = new Dictionary<string, RecordedEntry>(StringComparer.Ordinal);
         var recentSkillNames = new Dictionary<string, DateTime>(StringComparer.Ordinal);
+        var stats = new ExportStats
+        {
+            SourceCount = entries.Count
+        };
 
         foreach (var entry in entries.OrderBy(entry => entry.TimestampUtc))
         {
             if (ShouldSuppressExportEntry(entry, recentSkillNames))
+            {
+                stats.SuppressedStatusCount++;
                 continue;
+            }
 
             var mergeWindowMs = GetExportMergeWindowMs(entry);
             if (mergeWindowMs > 0)
@@ -640,17 +650,26 @@ public sealed class WhiteShaftGeneratorService : IDisposable
                 if (recentKeys.TryGetValue(key, out var last)
                     && (entry.TimestampUtc - last).TotalMilliseconds <= mergeWindowMs)
                 {
+                    if (recentMergeEntries.TryGetValue(key, out var kept))
+                    {
+                        kept.ExportRepeatCount++;
+                        kept.ExportLastTimestampUtc = entry.TimestampUtc;
+                    }
+
+                    stats.MergedDuplicateCount++;
                     continue;
                 }
 
                 recentKeys[key] = entry.TimestampUtc;
+                recentMergeEntries[key] = entry;
             }
 
             result.Add(entry);
             RememberRecentSkill(entry, recentSkillNames);
         }
 
-        return result;
+        stats.ExportedCount = result.Count;
+        return new ExportResult(result, stats);
     }
 
     private static bool ShouldSuppressExportEntry(RecordedEntry entry, Dictionary<string, DateTime> recentSkillNames)
@@ -684,7 +703,8 @@ public sealed class WhiteShaftGeneratorService : IDisposable
     {
         return entry.Kind switch
         {
-            RecordedEventKind.CastStart or RecordedEventKind.ActionEffect or RecordedEventKind.AutoAttack => ExportSkillMergeMs,
+            RecordedEventKind.ActionEffect or RecordedEventKind.AutoAttack => ExportRepeatedAbilityMergeMs,
+            RecordedEventKind.CastStart => ExportSkillMergeMs,
             RecordedEventKind.Targetable => ExportTargetableMergeMs,
             RecordedEventKind.TargetIcon => ExportTargetIconMergeMs,
             _ => 0
@@ -712,7 +732,7 @@ public sealed class WhiteShaftGeneratorService : IDisposable
     private static string BuildNamedSourceKey(string name, string sourceName)
         => $"{name}:{sourceName}";
 
-    private PureTimelineDocument BuildPureTimelineDocument(IReadOnlyList<RecordedEntry> entries, string reason)
+    private PureTimelineDocument BuildPureTimelineDocument(IReadOnlyList<RecordedEntry> entries, string reason, ExportStats stats)
     {
         var territoryId = (int)Svc.ClientState.TerritoryType;
         var jobId = (int)(PromeRotation.Core.Core.Me?.ClassJob.RowId ?? 0);
@@ -742,7 +762,7 @@ public sealed class WhiteShaftGeneratorService : IDisposable
                 JobId = jobId,
                 TerritoryId = territoryId,
                 CreatedAt = DateTime.Now,
-                Remark = $"由 {RecorderVersion} 导出，原因: {reason}，记录条目: {entries.Count}"
+                Remark = $"由 {RecorderVersion} 导出，原因: {reason}，{stats.BuildSummary()}"
             },
             Anchors = anchors
         };
@@ -772,7 +792,10 @@ public sealed class WhiteShaftGeneratorService : IDisposable
         return anchors;
     }
 
-    private static PureTimelineAnchor BuildPureTimelineAnchor(RecordedEntry entry, DateTime sessionStartUtc, ref bool firstSyncWritten)
+    private static PureTimelineAnchor BuildPureTimelineAnchor(
+        RecordedEntry entry,
+        DateTime sessionStartUtc,
+        ref bool firstSyncWritten)
     {
         var sync = BuildPureTimelineSync(entry, sessionStartUtc, ref firstSyncWritten);
         return new PureTimelineAnchor
@@ -931,8 +954,9 @@ public sealed class WhiteShaftGeneratorService : IDisposable
         };
     }
 
-    private string BuildCactbotTimeline(IReadOnlyList<RecordedEntry> entries)
+    private string BuildCactbotTimeline(ExportResult result)
     {
+        var entries = result.Entries;
         var sessionStartUtc = _sessionStartUtc == default
             ? entries.Min(entry => entry.TimestampUtc)
             : _sessionStartUtc;
@@ -942,6 +966,8 @@ public sealed class WhiteShaftGeneratorService : IDisposable
 
         builder.AppendLine($"### {EscapeCactbotHeader(territoryName)}");
         builder.AppendLine($"# ZoneId: {territoryId}");
+        builder.AppendLine($"# GeneratedBy: {RecorderVersion}");
+        builder.AppendLine($"# Summary: {EscapeCactbotHeader(result.Stats.BuildSummary())}");
         builder.AppendLine();
         builder.AppendLine("hideall \"--Reset--\"");
         builder.AppendLine("hideall \"--sync--\"");
@@ -979,7 +1005,7 @@ public sealed class WhiteShaftGeneratorService : IDisposable
             && entry.ActionId is { } actionId)
         {
             var source = BuildCactbotSourceCondition(entry);
-            var window = BuildCactbotSyncWindow(time, ref firstSyncWritten);
+            var window = BuildCactbotAbilityWindow(time, ref firstSyncWritten);
             return $"{time} \"{name}\" Ability {{ id: \"{actionId}\"{source} }}{window}";
         }
 
@@ -995,6 +1021,17 @@ public sealed class WhiteShaftGeneratorService : IDisposable
         return $" window {time},5";
     }
 
+    private static string BuildCactbotAbilityWindow(string time, ref bool firstSyncWritten)
+    {
+        if (!firstSyncWritten)
+        {
+            firstSyncWritten = true;
+            return $" window {time},5";
+        }
+
+        return " window 0,0";
+    }
+
     private static string BuildCactbotSourceCondition(RecordedEntry entry)
     {
         if (string.IsNullOrWhiteSpace(entry.SourceName) || entry.SourceId == 0)
@@ -1004,6 +1041,21 @@ public sealed class WhiteShaftGeneratorService : IDisposable
             return string.Empty;
 
         return $", source: \"{EscapeCactbotConditionValue(entry.SourceName)}\"";
+    }
+
+    private sealed record ExportResult(IReadOnlyList<RecordedEntry> Entries, ExportStats Stats);
+
+    private sealed class ExportStats
+    {
+        public int SourceCount { get; init; }
+        public int ExportedCount { get; set; }
+        public int MergedDuplicateCount { get; set; }
+        public int SuppressedStatusCount { get; set; }
+
+        public string BuildSummary()
+        {
+            return $"原始条目: {SourceCount}，导出条目: {ExportedCount}，合并重复: {MergedDuplicateCount}，过滤状态重复: {SuppressedStatusCount}";
+        }
     }
 
     private void DrawRecentEntries()
@@ -1421,12 +1473,16 @@ public sealed class WhiteShaftGeneratorService : IDisposable
         public string Summary { get; init; } = string.Empty;
         public string Detail { get; init; } = string.Empty;
         public string DeduplicationKey { get; init; } = string.Empty;
+        public int ExportRepeatCount { get; set; } = 1;
+        public DateTime? ExportLastTimestampUtc { get; set; }
 
         public string ToDisplayText(DateTime sessionStartUtc)
         {
             var text = $"{GetDisplayName()}({BuildActorPart()}) {FormatRelativeSeconds(TimestampUtc, sessionStartUtc)}";
             if (Kind == RecordedEventKind.CastStart && DurationMilliseconds is > 0)
                 text += $" 读条 {(DurationMilliseconds.Value / 1000f).ToString("F1", CultureInfo.InvariantCulture)}s";
+            if (ExportRepeatCount > 1)
+                text += $" x{ExportRepeatCount}";
 
             return text;
         }
@@ -1443,6 +1499,7 @@ public sealed class WhiteShaftGeneratorService : IDisposable
             {
                 RecordedEventKind.Targetable when Name.StartsWith("可选中", StringComparison.Ordinal) => "--可选中--",
                 RecordedEventKind.Targetable when Name.StartsWith("不可选中", StringComparison.Ordinal) => "--不可选中--",
+                RecordedEventKind.ActionEffect or RecordedEventKind.AutoAttack => AppendCactbotRepeatSuffix(BuildCactbotDisplayName(includeActorPart)),
                 _ => BuildCactbotDisplayName(includeActorPart)
             };
         }
@@ -1452,9 +1509,9 @@ public sealed class WhiteShaftGeneratorService : IDisposable
             return Kind switch
             {
                 RecordedEventKind.CastStart => $"{GetDisplayName()} 读条",
-                RecordedEventKind.ActionEffect or RecordedEventKind.AutoAttack => AppendSuffixIfMissing(GetDisplayName(), "判定"),
-                RecordedEventKind.Targetable when Name.StartsWith("可选中", StringComparison.Ordinal) => "--可选中--",
-                RecordedEventKind.Targetable when Name.StartsWith("不可选中", StringComparison.Ordinal) => "--不可选中--",
+                RecordedEventKind.ActionEffect or RecordedEventKind.AutoAttack => AppendRepeatSuffix(AppendSuffixIfMissing(GetDisplayName(), "判定")),
+                RecordedEventKind.Targetable when Name.StartsWith("可选中", StringComparison.Ordinal) => BuildEnvironmentDisplayName("对象可选中"),
+                RecordedEventKind.Targetable when Name.StartsWith("不可选中", StringComparison.Ordinal) => BuildEnvironmentDisplayName("对象不可选中"),
                 RecordedEventKind.ObjectCreate when DataId is { } dataId => $"对象出现 {dataId}",
                 RecordedEventKind.StatusAdd => Summary,
                 _ => GetDisplayName()
@@ -1475,6 +1532,15 @@ public sealed class WhiteShaftGeneratorService : IDisposable
             var text = value.Trim();
             return text.EndsWith(suffix, StringComparison.Ordinal) ? text : $"{text} {suffix}";
         }
+
+        private string AppendRepeatSuffix(string value)
+            => ExportRepeatCount > 1 ? $"{value} x{ExportRepeatCount}" : value;
+
+        private string AppendCactbotRepeatSuffix(string value)
+            => ExportRepeatCount > 1 ? $"{value} (x{ExportRepeatCount})" : value;
+
+        private string BuildEnvironmentDisplayName(string prefix)
+            => DataId is { } dataId ? $"{prefix} {dataId}" : prefix;
 
         private string BuildActorPart()
         {

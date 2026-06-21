@@ -20,18 +20,20 @@ JSON 文件结构:
 
 锚点 `Remark` 使用可读命令格式，例如 `攻击(来源:缇坦妮雅 目标:武士) +3.0s`；BOSS 读条保留技能 ID，例如 `欢快的安息日(15708)(来源:缇坦妮雅 目标:无目标) +8.1s 读条 3.7s`。
 
+短时间内同一来源、同一技能 ID 的重复判定会在导出阶段合并。合并后的锚点名称会追加 `xN`，用于表示多段伤害或连续判定次数。
+
 Boss 增益、队伍减益、点名、连线和其他手动开启的事件会生成普通锚点，用于保留记录上下文，后续可以在 PR PureTimeline 编辑器里手动整理。
 
 ## Cactbot timeline 文本
 
 TXT 文件使用 PR Cactbot 导入器支持的时间轴语法，时间字段使用距离战斗开始的绝对秒数:
 
-- 文件头包含副本名、`ZoneId` 和 `hideall "--sync--"`。
+- 文件头包含副本名、`ZoneId`、生成器版本、导出统计和 `hideall "--sync--"`。
 - 战斗开始写为 `0.0 "--sync--" InCombat { inGameCombat: "1" } window 0,1`。
 - BOSS 读条写为 `StartsUsing { id: "技能ID", source: "来源名" } duration 秒数 window ...`。
-- 敌方技能效果和普通攻击写为 `Ability { id: "技能ID", source: "来源名" } window ...`。
+- 敌方技能效果和普通攻击写为 `Ability { id: "技能ID", source: "来源名" } window ...`，首个可同步技能使用大窗口，后续判定默认使用 `window 0,0`。
 - Boss 增益、队伍减益、点名、连线、地图/对象、场地标记等没有直接同步条件的事件写为普通锚点。
-- 对象可选中/不可选中会输出为 `--targetable--` / `--untargetable--` 普通锚点。
+- 对象可选中/不可选中在 JSON 中显示为中文名称；TXT 中仍使用 Cactbot 习惯的 `--targetable--` / `--untargetable--` 普通锚点。
 
 导入后，读条和技能效果会映射为 PR 已支持的同步条件；普通锚点保留时间和名称用于后续手动整理。
 

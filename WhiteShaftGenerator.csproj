@@ -12,6 +12,9 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Remove="源码\**\*.cs" />
+    <Compile Remove="PtlEditorWindow*.cs" />
+    <None Include="PtlEditorWindow*.cs" />
     <PackageReference Include="ECommons" Version="3.2.0.3" />
     <ProjectReference Include="..\新新PR源码\PromeRotation-1.0-main\PromeRotation\PromeRotation.csproj" ReferenceOutputAssembly="true" Private="false" />
   </ItemGroup>
